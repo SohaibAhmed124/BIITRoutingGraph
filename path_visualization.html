@@ -1,0 +1,24 @@
+
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Shortest Path Visualization</title>
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+        <style>#map { height: 600px; }</style>
+    </head>
+    <body>
+        <div id="map"></div>
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <script>
+            var map = L.map('map').setView([33.661123, 73.084698], 15);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; OpenStreetMap contributors'
+            }).addTo(map);
+            var pathCoords = [[33.661123, 73.084698], [33.659382, 73.083996], [33.659306, 73.083966], [33.65876, 73.083743], [33.657136, 73.083141], [33.656616, 73.082904], [33.656568, 73.082882], [33.655915, 73.082612], [33.654437, 73.082037], [33.654432, 73.082079], [33.654427, 73.082113], [33.653891, 73.081905], [33.653021, 73.081568], [33.653007, 73.081987], [33.652635, 73.081991], [33.652598, 73.081998], [33.652423, 73.082029], [33.652274, 73.082052], [33.652174, 73.082055], [33.652152, 73.082071], [33.652016, 73.082052], [33.651707, 73.082014], [33.651543, 73.082029], [33.651552, 73.082379], [33.651602, 73.082686], [33.651615, 73.082798]];
+            L.polyline(pathCoords, {color: 'red'}).addTo(map);
+            L.marker([33.661123, 73.084698]).addTo(map).bindPopup('Start Node');
+            L.marker([33.651615, 73.082798]).addTo(map).bindPopup('End Node');
+        </script>
+    </body>
+    </html>
+    

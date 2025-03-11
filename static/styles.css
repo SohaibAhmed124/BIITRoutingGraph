@@ -1,0 +1,23 @@
+#map {
+    height: 600px;
+    width: 100%;
+}
+
+.input-container {
+    margin: 10px;
+}
+
+.input-container label {
+    display: block;
+    margin-bottom: 5px;
+}
+
+.input-container input {
+    width: 200px;
+    padding: 5px;
+}
+
+.input-container button {
+    padding: 5px 10px;
+    cursor: pointer;
+}
