@@ -2,6 +2,14 @@ import psycopg2
 import networkx as nx
 from scipy.spatial import KDTree
 import geojson
+from shapely.geometry import LineString, Point
+from shapely.validation import make_valid
+from shapely.strtree import STRtree
+import time
+import os
+import psutil
+
+
 
 # Database connection parameters
 DB_CONFIG = {
@@ -11,6 +19,25 @@ DB_CONFIG = {
     "host": "localhost",
     "port": "5432"
 }
+
+
+
+# def split_line_at_point(line, point):
+#     """Split a LineString at a given point, ensuring valid geometries."""
+#     line = make_valid(LineString(line))  # Ensure the LineString is valid
+#     point = make_valid(Point(point))     # Ensure the Point is valid
+
+#     if not line.is_valid or not point.is_valid:
+#         raise ValueError("Invalid geometry encountered.")
+
+#     if not line.contains(point) and not line.touches(point):
+#         raise ValueError("Point does not lie on the LineString.")
+
+#     distance = line.project(point)
+#     split_line = [
+#         list(line.interpolate(d).coords[0]) for d in [0, distance, line.length]
+#     ]
+#     return [split_line[0], split_line[1]], [split_line[1], split_line[2]]
 
 # Fetch GeoJSON data from the database
 def fetch_geojson_from_db():
@@ -36,47 +63,173 @@ def fetch_geojson_from_db():
         return None
 
 # Build graph from GeoJSON data
-def build_graph_from_geojson(geojson_data):
-    G = nx.DiGraph()  # Directed graph to handle one-way roads
 
+def find_intersection(line1, line2):
+    """Find intersection point between two LineStrings."""
+    line1 = LineString(line1)
+    line2 = LineString(line2)
+    intersection = line1.intersection(line2)
+    if intersection.is_empty:
+        return None
+    if intersection.geom_type == 'Point':
+        return intersection.coords[0]  # Return the intersection point
+    return None  # Ignore multi-point or line intersections
+
+def log_memory_usage():
+    """Log the current memory usage of the process."""
+    process = psutil.Process(os.getpid())
+    print(f"Memory usage: {process.memory_info().rss / 1024 ** 2:.2f} MB")
+
+def split_line_at_point(line, point):
+    """Split a LineString at a given point, ensuring valid geometries."""
+    line = make_valid(LineString(line))  # Ensure the LineString is valid
+    point = make_valid(Point(point))     # Ensure the Point is valid
+
+    if not line.is_valid or not point.is_valid:
+        raise ValueError("Invalid geometry encountered.")
+
+    if not line.contains(point) and not line.touches(point):
+        raise ValueError("Point does not lie on the LineString.")
+
+    distance = line.project(point)
+    split_line = [
+        list(line.interpolate(d).coords[0]) for d in [0, distance, line.length]
+    ]
+    return [split_line[0], split_line[1]], [split_line[1], split_line[2]]
+
+def build_graph_with_intersections(geojson_data, tolerance=0.0001):
+    """Build a graph from GeoJSON data, handling intersections and merging similar nodes."""
+    G = nx.DiGraph()
+    lines = []
+
+    # First pass: Collect all LineStrings and their geometries
+    line_geometries = []
     for feature in geojson_data['features']:
-        geometry = feature['geometry']
-        properties = feature.get('properties', {})
+        if feature['geometry']['type'] == 'LineString':
+            coords = feature['geometry']['coordinates']
+            properties = feature.get('properties', {})
+            try:
+                line = make_valid(LineString(coords))
+                if not line.is_valid:
+                    print(f"Skipping invalid LineString: {coords}")
+                    continue
+                lines.append({
+                    'geometry': line,
+                    'coordinates': coords,
+                    'properties': properties
+                })
+                line_geometries.append(line)
+            except Exception as e:
+                print(f"Error creating LineString: {e}")
+                continue
 
-        if geometry['type'] == 'LineString':
-            coords = geometry['coordinates']
-            is_oneway = properties.get('oneway', 'no') == 'yes'  # Check if road is one-way
+    # Build a spatial index
+    tree = STRtree(line_geometries)
 
-            for i in range(len(coords) - 1):
-                source = tuple(coords[i])
-                target = tuple(coords[i + 1])
-                cost = properties.get('cost', 1)  # Default cost if not provided
+    # Second pass: Detect intersections and split LineStrings
+    new_lines = []
+    batch_size = 1000  # Adjust batch size as needed
+    batches = [lines[i:i + batch_size] for i in range(0, len(lines), batch_size)]
+    max_candidates = 2000  # Skip LineStrings with too many candidates
+    max_intersections = 50  # Skip LineStrings with too many intersection points
 
-                # Add nodes
-                G.add_node(source, pos=source)
-                G.add_node(target, pos=target)
+    for batch in batches:
+        start_time = time.time()
+        batch_index = batches.index(batch) + 1
+        print(f"Processing batch {batch_index}/{len(batches)}")
+        log_memory_usage()
 
-                # Add directed edge (one-way)
-                G.add_edge(source, target, weight=cost)
-                if not is_oneway:
-                    G.add_edge(target, source, weight=cost)  # Add reverse edge if not one-way
+        for line1 in batch:
+            coords1 = line1['coordinates']
+            split_points = set()
+            candidates = tree.query(line1['geometry'])
+            num_candidates = len(candidates)
+            print(f"LineString {batch.index(line1) + 1}/{len(batch)}: {num_candidates} candidates")
 
-        elif geometry['type'] == 'Polygon':
-            exterior_ring = geometry['coordinates'][0]
-            for i in range(len(exterior_ring) - 1):
-                source = tuple(exterior_ring[i])
-                target = tuple(exterior_ring[i + 1])
-                cost = properties.get('cost', 1)
+            if num_candidates > max_candidates:
+                print(f"Skipping LineString {batch.index(line1) + 1}/{len(batch)}: too many candidates ({num_candidates})")
+                continue
 
-                G.add_node(source, pos=source)
-                G.add_node(target, pos=target)
-                G.add_edge(source, target, weight=cost)
+            for candidate in candidates:
+                if candidate == line1['geometry']:
+                    continue  # Skip self
+                if not isinstance(candidate, LineString):
+                    continue  # Skip invalid candidates
+                try:
+                    intersection = line1['geometry'].buffer(tolerance).intersection(candidate.buffer(tolerance))
+                    if intersection.is_empty:
+                        continue
+                    if intersection.geom_type == 'Point':
+                        split_points.add(intersection.coords[0])
+                except Exception as e:
+                    print(f"Error computing intersection: {e}")
+                    continue
 
-        elif geometry['type'] == 'Point':
-            G.add_node(tuple(geometry['coordinates']), pos=tuple(geometry['coordinates']))
+            num_intersections = len(split_points)
+            print(f"LineString {batch.index(line1) + 1}/{len(batch)}: {num_intersections} intersection points")
 
-        else:
-            print(f"Unsupported geometry type: {geometry['type']}")
+            if num_intersections > max_intersections:
+                print(f"Skipping LineString {batch.index(line1) + 1}/{len(batch)}: too many intersections ({num_intersections})")
+                continue
+
+            if split_points:
+                current_line = coords1
+                for point in sorted(split_points, key=lambda p: LineString(current_line).project(Point(p))):
+                    try:
+                        part1, part2 = split_line_at_point(current_line, point)
+                        new_lines.append({'coordinates': part1, 'properties': line1['properties']})
+                        current_line = part2
+                    except ValueError as e:
+                        print(f"Skipping invalid split: {e}")
+                new_lines.append({'coordinates': current_line, 'properties': line1['properties']})
+            else:
+                new_lines.append(line1)
+
+        end_time = time.time()
+        print(f"Batch {batch_index} processed in {end_time - start_time:.2f} seconds")
+        log_memory_usage()
+
+    # Third pass: Add nodes and edges to the graph
+    for line in new_lines:
+        coords = line['coordinates']
+        properties = line['properties']
+        is_oneway = properties.get('oneway', 'no') == 'yes'
+        cost = properties.get('cost', 1)
+
+        for i in range(len(coords) - 1):
+            source = tuple(coords[i])
+            target = tuple(coords[i + 1])
+
+            G.add_node(source, pos=source)
+            G.add_node(target, pos=target)
+
+            G.add_edge(source, target, weight=cost)
+            if not is_oneway:
+                G.add_edge(target, source, weight=cost)
+
+    # Merge similar nodes
+    G = merge_similar_nodes(G, tolerance)
+
+    return G
+
+def merge_similar_nodes(G, tolerance=0.0001):
+    """Merge nodes that are within a given tolerance."""
+    nodes = list(G.nodes)
+    merged_nodes = {}
+
+    for i, node1 in enumerate(nodes):
+        if node1 in merged_nodes:
+            continue
+        for j in range(i + 1, len(nodes)):
+            node2 = nodes[j]
+            if abs(node1[0] - node2[0]) < tolerance and abs(node1[1] - node2[1]) < tolerance:
+                merged_nodes[node2] = node1
+
+    # Update the graph
+    for old_node, new_node in merged_nodes.items():
+        for neighbor in G[old_node]:
+            G.add_edge(new_node, neighbor, **G[old_node][neighbor])
+        G.remove_node(old_node)
 
     return G
 
@@ -126,7 +279,7 @@ if __name__ == "__main__":
         exit()
 
     # Build the graph
-    G = build_graph_from_geojson(geojson_data)
+    G = build_graph_with_intersections(geojson_data)
     print(f"Graph built with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges.")
 
     # Build K-D Tree
